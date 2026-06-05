@@ -2010,23 +2010,13 @@ class TspuChecker:
             return None
         return url, False
 
-    # ===================================================================================================================================================
-    # ====================================================================== 20 VPN-клиент: подписка → Client Hello ======================================
-    # ===================================================================================================================================================
-    def test_vpn_subscription_handshake(self) -> None:
-        """Имитация старта VPN-клиента: загрузка подписки, TCP, Client Hello."""
-        self.clear_screen()
-        self.print_header()
-        print(f"{YELLOW}[20] 📲 VPN-клиент: подписка → Client Hello{NC}\n")
-        print(
-            f"{CYAN}Полная имитация VPN-клиента: xray-core (uTLS + REALITY + VLESS).{NC}\n"
-            f"{CYAN}Для подписок с mlkem768 нужен xray в PATH или XRAY_PATH.{NC}\n"
-        )
-
+    def _pick_subscription_and_profile(
+        self,
+    ) -> tuple[VpnSubscriptionProfile, str, bool] | None:
+        """Выбор подписки, загрузка и выбор профиля. None при ошибке или отмене."""
         picked = self._select_subscription_url()
         if picked is None:
-            self.pause()
-            return
+            return None
         url, url_from_config = picked
 
         print(f"\n{CYAN}── 1. Загрузка подписки ──{NC}")
@@ -2034,16 +2024,13 @@ class TspuChecker:
             profiles = self.load_subscription_profiles(url)
         except urllib.error.URLError as e:
             print(f"  {RED}❌ Не удалось загрузить подписку: {e}{NC}")
-            self.pause()
-            return
+            return None
         except (ValueError, binascii.Error, UnicodeDecodeError) as e:
             print(f"  {RED}❌ Ошибка разбора подписки: {e}{NC}")
-            self.pause()
-            return
+            return None
         except OSError as e:
             print(f"  {RED}❌ Сетевая ошибка: {e}{NC}")
-            self.pause()
-            return
+            return None
 
         print(f"  {GREEN}✓ Загружено профилей: {len(profiles)}{NC}")
         if len(profiles) > 1:
@@ -2057,43 +2044,79 @@ class TspuChecker:
                 idx = 0
             if not 0 <= idx < len(profiles):
                 print(f"{RED}❌ Неверный номер профиля{NC}")
-                self.pause()
-                return
+                return None
             profile = profiles[idx]
         else:
             profile = profiles[0]
 
         print(f"\n{CYAN}── 2. Параметры из подписки (как в VPN-клиенте) ──{NC}")
         self._print_subscription_profile(profile)
+        return profile, url, url_from_config
+
+    def _offer_save_subscription(
+        self, url: str, url_from_config: bool, profile: VpnSubscriptionProfile
+    ) -> None:
+        if url_from_config:
+            return
+        save = input(
+            f"\n{CYAN}Сохранить URL подписки и параметры в конфиг? [y/N]: {NC}"
+        ).strip().lower()
+        if save not in ("y", "yes", "д", "да"):
+            return
+        if self.subscription_urls:
+            slot = input(
+                f"{CYAN}Номер слота SUBSCRIPTION_URL_N [0]: {NC}"
+            ).strip() or "0"
+            try:
+                slot_idx = int(slot)
+            except ValueError:
+                slot_idx = 0
+            while len(self.subscription_urls) <= slot_idx:
+                self.subscription_urls.append("")
+            self.subscription_urls[slot_idx] = url
+        else:
+            self.subscription_urls = [url]
+        self.subscription_url = self.subscription_urls[0]
+        self.server_ip = profile.host
+        self.reality_port = profile.port
+        self.reality_sni = profile.sni
+        self.save_config()
+        print(f"{GREEN}✓ Сохранено в server.conf{NC}")
+
+    # ===================================================================================================================================================
+    # ====================================================================== 20 VPN-клиент: подписка → Client Hello ======================================
+    # ===================================================================================================================================================
+    def test_vpn_subscription_handshake(self) -> None:
+        """Имитация старта VPN-клиента: загрузка подписки, TCP, Client Hello."""
+        self.clear_screen()
+        self.print_header()
+        print(f"{YELLOW}[20] 📲 VPN-клиент: подписка → Client Hello{NC}\n")
+        print(
+            f"{CYAN}Диагностика пути до VPS: TCP и прямой Client Hello (видно в tcpdump).{NC}\n"
+            f"{CYAN}Полный туннель через xray — пункт 21.{NC}\n"
+        )
+
+        picked = self._pick_subscription_and_profile()
+        if picked is None:
+            self.pause()
+            return
+        profile, url, url_from_config = picked
 
         host, port, sni = profile.host, profile.port, profile.sni
         chlo_profile = self._tls_fp_profile(profile.fp)
 
-        print(f"\n{CYAN}── 3. TCP-соединение к VPN-серверу ──{NC}")
-        print(f"  connect({host}, {port}) ... ", end="", flush=True)
-        if not self.check_port_tcp(host, port):
-            print(f"{RED}НЕДОСТУПЕН{NC}")
-            print(f"\n{RED}⚠️ VPN-клиент не смог бы установить TCP — проверьте L3/белый список (п. 1, 3).{NC}")
-            self.pause()
-            return
-        print(f"{GREEN}OK{NC}")
+        #print(f"\n{CYAN}── 3. TCP-соединение к VPN-серверу ──{NC}")
+        # print(f"  connect({host}, {port}) ... ", end="", flush=True)
+        # if not self.check_port_tcp(host, port):
+        #     print(f"{RED}НЕДОСТУПЕН{NC}")
+        #     print(f"\n{RED}⚠️ VPN-клиент не смог бы установить TCP — проверьте L3/белый список (п. 1, 3).{NC}")
+        #     self.pause()
+        #     return
+        # print(f"{GREEN}OK{NC}")
 
         use_reality = profile.security == "reality" and profile.pbk and profile.sid is not None
-        xray_bin = self.find_xray_binary() if use_reality else None
         direct_result: TlsProbeResult | None = None
-        tunnel_result: TlsProbeResult | None = None
         method = f"подписка/{profile.fp}"
-
-        if use_reality and self._needs_xray_for_profile(profile) and not xray_bin:
-            print(f"\n{RED}❌ Подписка использует VLESS Encryption (mlkem768).{NC}")
-            print(
-                f"{YELLOW}Для полного туннеля нужен xray-core:{NC}\n"
-                f"  • скачайте Xray-windows-64.zip с github.com/XTLS/Xray-core/releases\n"
-                f"  • положите xray.exe рядом с net_check.py или добавьте в PATH\n"
-                f"  • либо задайте переменную окружения XRAY_PATH"
-            )
-            self.pause()
-            return
 
         if use_reality:
             print(
@@ -2106,18 +2129,7 @@ class TspuChecker:
                 direct_result,
                 reality_auth_failed=direct_result.alert_name == "handshake_failure",
             )
-
-            if xray_bin:
-                print(f"\n{CYAN}── 5. Туннель через xray ({xray_bin.name}) ──{NC}")
-                print(
-                    f"  {YELLOW}Успех только если через туннель пришли данные; "
-                    f"SOCKS CONNECT сам по себе не считается успехом.{NC}\n"
-                )
-                tunnel_result = self.probe_reality_via_xray(profile)
-                method = f"xray/{profile.fp}"
-                self._print_probe("Проверка туннеля xray", tunnel_result)
-
-            result = tunnel_result or direct_result
+            result = direct_result
         else:
             print(f"\n{CYAN}── 4. Client Hello (fp={profile.fp} → {chlo_profile}) ──{NC}")
             print(f"  SNI={sni}, без REALITY-auth (нет pbk/sid в подписке)\n")
@@ -2128,9 +2140,7 @@ class TspuChecker:
             result,
             method,
             reality_vps=use_reality,
-            reality_authenticated=bool(
-                tunnel_result and tunnel_result.status in ("ok", "server_hello")
-            ),
+            reality_authenticated=False,
             vps_reachable=bool(
                 direct_result and (
                     direct_result.path_reachable
@@ -2155,30 +2165,7 @@ class TspuChecker:
                 print(
                     f"  {RED}● Прямой TLS: нет ответа — Client Hello, возможно, не доходит до VPS.{NC}"
                 )
-
-        if tunnel_result:
-            if tunnel_result.status in ("ok", "server_hello"):
-                print(
-                    f"  {GREEN}● Туннель xray: данные прошли — REALITY+VLESS работают "
-                    f"(на сервере должен быть TLS к {host}:{port}).{NC}"
-                )
-            elif tunnel_result.status == "timeout":
-                print(
-                    f"  {RED}● Туннель xray: TLS не подтверждён — в логе xray есть ошибка "
-                    f"или туннель не установился.{NC}"
-                )
-            elif tunnel_result.status in ("ok", "server_hello") and tunnel_result.bytes_received == 0:
-                print(
-                    f"  {GREEN}● Туннель xray: TLS к VPS, похоже, прошёл (ошибок в логе xray нет).{NC}\n"
-                    f"     Ответ от 1.1.1.1 не получен — возможен белый список dest, не VPS."
-                )
-            elif tunnel_result.alert_name == "handshake_failure":
-                print(f"  {RED}● Туннель xray: TLS handshake failure.{NC}")
-        elif use_reality and not xray_bin:
-            print(
-                f"  {YELLOW}● Туннель xray не проверялся (xray не найден). "
-                f"Смотрите только прямой TLS (шаг 4).{NC}"
-            )
+            print(f"  {CYAN}● Полный туннель (xray + mlkem768) — пункт 21.{NC}")
         elif not use_reality and result.status in ("ok", "server_hello"):
             print(f"  {GREEN}● Client Hello прошёл — сеть, скорее всего, не блокирует.{NC}")
         elif not use_reality and result.path_reachable:
@@ -2190,31 +2177,96 @@ class TspuChecker:
         elif not use_reality:
             print(f"  {YELLOW}● Неоднозначный результат — см. детали выше.{NC}")
 
-        if not url_from_config:
-            save = input(
-                f"\n{CYAN}Сохранить URL подписки и параметры в конфиг? [y/N]: {NC}"
-            ).strip().lower()
-            if save in ("y", "yes", "д", "да"):
-                if self.subscription_urls:
-                    slot = input(
-                        f"{CYAN}Номер слота SUBSCRIPTION_URL_N [0]: {NC}"
-                    ).strip() or "0"
-                    try:
-                        slot_idx = int(slot)
-                    except ValueError:
-                        slot_idx = 0
-                    while len(self.subscription_urls) <= slot_idx:
-                        self.subscription_urls.append("")
-                    self.subscription_urls[slot_idx] = url
-                else:
-                    self.subscription_urls = [url]
-                self.subscription_url = self.subscription_urls[0]
-                self.server_ip = host
-                self.reality_port = port
-                self.reality_sni = sni
-                self.save_config()
-                print(f"{GREEN}✓ Сохранено в server.conf{NC}")
+        self._offer_save_subscription(url, url_from_config, profile)
+        self.pause()
 
+    # ===================================================================================================================================================
+    # ====================================================================== 21 VPN-клиент: туннель через xray =========================================
+    # ===================================================================================================================================================
+    def test_vpn_xray_tunnel(self) -> None:
+        """Проверка REALITY+VLESS через xray-core (полный VPN-клиент)."""
+        self.clear_screen()
+        self.print_header()
+        print(f"{YELLOW}[21] 🚀 VPN-клиент: туннель через xray{NC}\n")
+        print(
+            f"{CYAN}Полная имитация VPN-клиента: xray-core (uTLS + REALITY + VLESS).{NC}\n"
+            f"{CYAN}Для подписок с mlkem768 нужен xray в PATH или XRAY_PATH.{NC}\n"
+            f"{CYAN}Успех только если через туннель пришли данные; SOCKS CONNECT сам по себе не считается успехом.{NC}\n"
+        )
+
+        picked = self._pick_subscription_and_profile()
+        if picked is None:
+            self.pause()
+            return
+        profile, url, url_from_config = picked
+
+        host, port = profile.host, profile.port
+        use_reality = profile.security == "reality" and profile.pbk and profile.sid is not None
+        if not use_reality:
+            print(f"\n{RED}❌ Профиль без REALITY (pbk/sid) — туннель xray не применим.{NC}")
+            self.pause()
+            return
+
+        xray_bin = self.find_xray_binary()
+        if self._needs_xray_for_profile(profile) and not xray_bin:
+            print(f"\n{RED}❌ Подписка использует VLESS Encryption (mlkem768).{NC}")
+            print(
+                f"{YELLOW}Нужен xray-core:{NC}\n"
+                f"  • скачайте Xray-windows-64.zip с github.com/XTLS/Xray-core/releases\n"
+                f"  • положите xray.exe рядом с net_check.py или добавьте в PATH\n"
+                f"  • либо задайте переменную окружения XRAY_PATH"
+            )
+            self.pause()
+            return
+        if not xray_bin:
+            print(f"\n{RED}❌ xray-core не найден (PATH, XRAY_PATH или xray.exe рядом со скриптом).{NC}")
+            self.pause()
+            return
+
+        print(f"\n{CYAN}── 3. TCP-соединение к VPN-серверу ──{NC}")
+        print(f"  connect({host}, {port}) ... ", end="", flush=True)
+        if not self.check_port_tcp(host, port):
+            print(f"{RED}НЕДОСТУПЕН{NC}")
+            print(f"\n{RED}⚠️ xray не сможет подключиться — проверьте L3/белый список (п. 1, 3).{NC}")
+            self.pause()
+            return
+        print(f"{GREEN}OK{NC}")
+
+        print(f"\n{CYAN}── 4. Туннель через xray ({xray_bin.name}) ──{NC}\n")
+        tunnel_result = self.probe_reality_via_xray(profile)
+        method = f"xray/{profile.fp}"
+        self._print_probe("Проверка туннеля xray", tunnel_result)
+
+        self._print_tls_interpretation(
+            tunnel_result,
+            method,
+            reality_vps=True,
+            reality_authenticated=tunnel_result.status in ("ok", "server_hello"),
+            vps_reachable=False,
+        )
+
+        print(f"\n{BLUE}═══ Итог для VPN-клиента ═══{NC}")
+        if tunnel_result.status in ("ok", "server_hello") and tunnel_result.bytes_received > 0:
+            print(
+                f"  {GREEN}● Туннель xray: данные прошли — REALITY+VLESS работают "
+                f"(на сервере должен быть TLS к {host}:{port}).{NC}"
+            )
+        elif tunnel_result.status in ("ok", "server_hello") and tunnel_result.bytes_received == 0:
+            print(
+                f"  {GREEN}● Туннель xray: TLS к VPS, похоже, прошёл (ошибок в логе xray нет).{NC}\n"
+                f"     Ответ от 1.1.1.1 не получен — возможен белый список dest, не VPS."
+            )
+        elif tunnel_result.status == "timeout":
+            print(
+                f"  {RED}● Туннель xray: TLS не подтверждён — в логе xray есть ошибка "
+                f"или туннель не установился.{NC}"
+            )
+        elif tunnel_result.alert_name == "handshake_failure":
+            print(f"  {RED}● Туннель xray: TLS handshake failure.{NC}")
+        else:
+            print(f"  {YELLOW}● Неоднозначный результат — см. детали выше.{NC}")
+
+        self._offer_save_subscription(url, url_from_config, profile)
         self.pause()
 
     # ------------------------------------------------------------------ menu
@@ -2244,6 +2296,7 @@ class TspuChecker:
         print(f"  {BLUE}18{NC}) 📨 Client Hello сырой (Chrome, как uTLS)")
         print(f"  {BLUE}19{NC}) 🛡️  Полная диагностика VPN/REALITY")
         print(f"  {BLUE}20{NC}) 📲 VPN-клиент: подписка → Client Hello")
+        print(f"  {BLUE}21{NC}) 🚀 VPN-клиент: туннель через xray")
         print(f"  {BLUE}q{NC}) ❌ Выход")
         print()
 
@@ -2270,6 +2323,7 @@ class TspuChecker:
             "18": self.test_raw_client_hello,
             "19": self.test_reality_full,
             "20": self.test_vpn_subscription_handshake,
+            "21": self.test_vpn_xray_tunnel,
         }
         while True:
             self.show_menu()
