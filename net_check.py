@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import json
 import http.server
 import os
 import platform
@@ -21,6 +22,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -28,8 +30,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qs, unquote
 
-VERSION = "4.7"
+VERSION = "5.0"
 DEFAULT_SERVER_IP = "178.154.212.182"
+XRAY_VERSION = (26, 6, 1)  # core.Version_x/y/z — для REALITY Session ID
 DEFAULT_REALITY_SNI = "www.microsoft.com"
 DEFAULT_REALITY_PORT = 443
 BLOCKED_TEST_IP = "173.194.222.113"
@@ -79,6 +82,9 @@ class VpnSubscriptionProfile:
     flow: str | None
     sid: str | None
     pbk: str | None
+    encryption: str | None
+    pqv: str | None
+    spx: str | None
     network: str
     raw_link: str
 
@@ -107,6 +113,7 @@ class TspuChecker:
         self.server_ip = DEFAULT_SERVER_IP
         self.reality_sni = DEFAULT_REALITY_SNI
         self.reality_port = DEFAULT_REALITY_PORT
+        self.subscription_urls: list[str] = []
         self.subscription_url = ""
         config_file().parent.mkdir(parents=True, exist_ok=True)
         self.load_config()
@@ -128,6 +135,9 @@ class TspuChecker:
                 ip_match = re.search(r"^([\d.]+)\s*$", text.strip(), re.MULTILINE)
             sni_match = re.search(r'REALITY_SNI\s*=\s*"([^"]+)"', text)
             port_match = re.search(r'REALITY_PORT\s*=\s*"?(\d+)"?', text)
+            numbered_subs = re.findall(
+                r'SUBSCRIPTION_URL_(\d+)\s*=\s*"([^"]+)"', text
+            )
             sub_match = re.search(r'SUBSCRIPTION_URL\s*=\s*"([^"]+)"', text)
             if ip_match:
                 self.server_ip = ip_match.group(1)
@@ -135,11 +145,17 @@ class TspuChecker:
                 self.reality_sni = sni_match.group(1)
             if port_match:
                 self.reality_port = int(port_match.group(1))
-            if sub_match:
-                self.subscription_url = sub_match.group(1)
+            if numbered_subs:
+                numbered_subs.sort(key=lambda item: int(item[0]))
+                self.subscription_urls = [url for _, url in numbered_subs]
+            elif sub_match:
+                self.subscription_urls = [sub_match.group(1)]
+            self.subscription_url = self.subscription_urls[0] if self.subscription_urls else ""
             print(f"{GREEN}✓ Конфиг: сервер {self.server_ip}, REALITY SNI {self.reality_sni}:{self.reality_port}{NC}")
-            if self.subscription_url:
-                print(f"{GREEN}✓ Подписка VPN сохранена{NC}")
+            if self.subscription_urls:
+                print(
+                    f"{GREEN}✓ Подписок VPN в конфиге: {len(self.subscription_urls)}{NC}"
+                )
         else:
             print(
                 f"{YELLOW}⚠ По умолчанию: {DEFAULT_SERVER_IP}, "
@@ -153,7 +169,10 @@ class TspuChecker:
             f'REALITY_SNI="{self.reality_sni}"',
             f'REALITY_PORT="{self.reality_port}"',
         ]
-        if self.subscription_url:
+        if self.subscription_urls:
+            for i, url in enumerate(self.subscription_urls):
+                lines.append(f'SUBSCRIPTION_URL_{i}="{url}"')
+        elif self.subscription_url:
             lines.append(f'SUBSCRIPTION_URL="{self.subscription_url}"')
         config_file().write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -299,6 +318,9 @@ class TspuChecker:
             flow=params.get("flow") or None,
             sid=params.get("sid"),
             pbk=params.get("pbk"),
+            encryption=params.get("encryption") or None,
+            pqv=params.get("pqv") or None,
+            spx=params.get("spx") or None,
             network=params.get("type", "tcp"),
             raw_link=link,
         )
@@ -328,6 +350,224 @@ class TspuChecker:
         if profile.pbk:
             pbk_short = profile.pbk if len(profile.pbk) <= 24 else profile.pbk[:21] + "..."
             print(f"  publicKey:{GREEN}{pbk_short}{NC}")
+        if profile.encryption and profile.encryption != "none":
+            enc_label = profile.encryption.split(".", 1)[0]
+            print(f"  VLESS enc:{GREEN}{enc_label}{NC}")
+
+    @staticmethod
+    def find_xray_binary() -> Path | None:
+        env_path = os.environ.get("XRAY_PATH", "").strip()
+        if env_path:
+            candidate = Path(env_path)
+            if candidate.is_file():
+                return candidate
+        for name in ("xray", "xray.exe"):
+            found = shutil.which(name)
+            if found:
+                return Path(found)
+        for candidate in (SCRIPT_DIR / "xray.exe", SCRIPT_DIR / "xray"):
+            if candidate.is_file():
+                return candidate
+        return None
+
+    @staticmethod
+    def _needs_xray_for_profile(profile: VpnSubscriptionProfile) -> bool:
+        enc = (profile.encryption or "").lower()
+        return bool(enc and enc != "none" and "mlkem" in enc)
+
+    @classmethod
+    def _build_xray_probe_config(cls, profile: VpnSubscriptionProfile) -> tuple[dict, int]:
+        user: dict = {"id": profile.uuid, "encryption": profile.encryption or "none"}
+        if profile.flow:
+            user["flow"] = profile.flow
+        reality_settings: dict = {
+            "serverName": profile.sni,
+            "fingerprint": profile.fp,
+            "publicKey": profile.pbk,
+            "shortId": profile.sid,
+            "spiderX": profile.spx or "/",
+        }
+        if profile.pqv:
+            reality_settings["mldsa65Verify"] = profile.pqv
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            socks_port = s.getsockname()[1]
+        cfg = {
+            "log": {"loglevel": "warning"},
+            "inbounds": [
+                {
+                    "listen": "127.0.0.1",
+                    "port": socks_port,
+                    "protocol": "socks",
+                    "settings": {"udp": True},
+                }
+            ],
+            "outbounds": [
+                {
+                    "tag": "proxy",
+                    "protocol": "vless",
+                    "settings": {
+                        "vnext": [
+                            {
+                                "address": profile.host,
+                                "port": profile.port,
+                                "users": [user],
+                            }
+                        ]
+                    },
+                    "streamSettings": {
+                        "network": profile.network,
+                        "security": "reality",
+                        "realitySettings": reality_settings,
+                    },
+                }
+            ],
+        }
+        return cfg, socks_port
+
+    @staticmethod
+    def _read_process_output(proc: subprocess.Popen, buf: list[str]) -> None:
+        if not proc.stdout:
+            return
+        for line in proc.stdout:
+            buf.append(line)
+
+    @classmethod
+    def probe_reality_via_xray(
+        cls, profile: VpnSubscriptionProfile, timeout: float | None = None
+    ) -> TlsProbeResult:
+        """Проверка REALITY через xray: успех если данные прошли или в логе нет TLS-ошибок."""
+        if timeout is None:
+            timeout = 25.0 if cls._needs_xray_for_profile(profile) else 15.0
+        xray = cls.find_xray_binary()
+        if not xray:
+            return TlsProbeResult(
+                "error",
+                "xray не найден: добавьте в PATH, задайте XRAY_PATH или положите xray.exe рядом со скриптом",
+            )
+        cfg, socks_port = cls._build_xray_probe_config(profile)
+        proc: subprocess.Popen | None = None
+        log_lines: list[str] = []
+        try:
+            with tempfile.TemporaryDirectory() as tmp:
+                cfg_path = Path(tmp) / "probe.json"
+                cfg_path.write_text(json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
+                proc = subprocess.Popen(
+                    [str(xray), "run", "-c", str(cfg_path)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                )
+                reader = threading.Thread(
+                    target=cls._read_process_output,
+                    args=(proc, log_lines),
+                    daemon=True,
+                )
+                reader.start()
+                time.sleep(2)
+                if proc.poll() is not None:
+                    reader.join(timeout=1)
+                    log_output = "".join(log_lines)
+                    return TlsProbeResult(
+                        "error",
+                        f"xray завершился с кодом {proc.returncode}: {log_output[-200:]}",
+                    )
+
+                tunnel_bytes = 0
+                try:
+                    with socket.create_connection(("127.0.0.1", socks_port), timeout=5) as sock:
+                        sock.settimeout(timeout)
+                        sock.sendall(b"\x05\x01\x00")
+                        if sock.recv(2) != b"\x05\x00":
+                            return TlsProbeResult("error", "SOCKS xray: ошибка рукопожатия")
+                        sock.sendall(
+                            b"\x05\x01\x00\x01"
+                            + socket.inet_aton("1.1.1.1")
+                            + struct.pack("!H", 443)
+                        )
+                        resp = sock.recv(10)
+                        if len(resp) < 2 or resp[1] != 0:
+                            code = resp[1] if len(resp) > 1 else -1
+                            return TlsProbeResult(
+                                "alert",
+                                f"SOCKS CONNECT отклонён (код {code}) — xray не установил туннель",
+                                alert_name="handshake_failure",
+                            )
+                        # mlkem768 + REALITY: дать xray время на полный TLS к VPS
+                        time.sleep(3 if cls._needs_xray_for_profile(profile) else 1)
+                        sock.sendall(
+                            b"GET / HTTP/1.1\r\nHost: 1.1.1.1\r\nConnection: close\r\n\r\n"
+                        )
+                        deadline = time.monotonic() + timeout
+                        chunks: list[bytes] = []
+                        while time.monotonic() < deadline:
+                            log_text = "".join(log_lines).lower()
+                            if "handshake failure" in log_text or "failed to process outbound" in log_text:
+                                break
+                            try:
+                                sock.settimeout(max(0.3, deadline - time.monotonic()))
+                                part = sock.recv(4096)
+                            except socket.timeout:
+                                continue
+                            except OSError:
+                                break
+                            if not part:
+                                break
+                            chunks.append(part)
+                            if sum(len(c) for c in chunks) >= 16:
+                                break
+                        tunnel_bytes = sum(len(c) for c in chunks)
+                except OSError as exc:
+                    return TlsProbeResult("tcp_fail", f"SOCKS xray: {exc}")
+                finally:
+                    time.sleep(0.5)
+                    if proc.poll() is None:
+                        proc.terminate()
+                    try:
+                        proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=1)
+                    reader.join(timeout=1)
+        except OSError as exc:
+            return TlsProbeResult("error", f"Не удалось запустить xray: {exc}")
+        finally:
+            if proc and proc.poll() is None:
+                proc.kill()
+
+        log_output = "".join(log_lines)
+        low = log_output.lower()
+        if "handshake failure" in low or "failed to process outbound" in low:
+            return TlsProbeResult(
+                "alert",
+                "xray: TLS handshake failure (REALITY/VLESS не принят сервером)",
+                alert_name="handshake_failure",
+            )
+        if tunnel_bytes <= 0:
+            if "handshake failure" not in low and "failed to process outbound" not in low:
+                return TlsProbeResult(
+                    "server_hello",
+                    "xray: в логе нет TLS-ошибок, но ответ от 1.1.1.1:443 не получен — "
+                    "REALITY к VPS, вероятно, установлен; dest может не отвечать или быть в белом списке",
+                )
+            return TlsProbeResult(
+                "timeout",
+                "SOCKS принял CONNECT, но ответ через туннель не пришёл — "
+                "REALITY TLS не подтверждён",
+            )
+
+        ver = ""
+        for line in log_output.splitlines():
+            if line.startswith("Xray "):
+                ver = line.split("(", 1)[0].strip()
+                break
+        return TlsProbeResult(
+            "server_hello",
+            f"{ver or 'xray'}: через туннель получено {tunnel_bytes} байт — "
+            f"REALITY TLS к {profile.host}:{profile.port} работает",
+            tunnel_bytes,
+        )
 
     @staticmethod
     def check_port_tcp(host: str, port: int, timeout: float = 3.0) -> bool:
@@ -532,7 +772,95 @@ class TspuChecker:
         return b"\x00\x10" + struct.pack("!H", len(inner)) + inner
 
     @staticmethod
-    def build_client_hello(sni: str, profile: str = "chrome") -> bytes:
+    def _require_crypto():
+        try:
+            from cryptography.hazmat.primitives import hashes
+            from cryptography.hazmat.primitives.asymmetric.x25519 import (
+                X25519PrivateKey,
+                X25519PublicKey,
+            )
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+        except ImportError as exc:
+            raise ImportError(
+                "Для REALITY Client Hello нужен пакет cryptography: pip install cryptography"
+            ) from exc
+        return hashes, X25519PrivateKey, X25519PublicKey, AESGCM, HKDF
+
+    @staticmethod
+    def _decode_reality_public_key(pbk: str) -> bytes:
+        pbk = pbk.strip()
+        padded = pbk + "=" * (-len(pbk) % 4)
+        for decoder in (base64.urlsafe_b64decode, base64.b64decode):
+            try:
+                key = decoder(padded.encode("ascii"))
+            except binascii.Error:
+                continue
+            if len(key) == 32:
+                return key
+        raise ValueError("Некорректный publicKey (ожидается 32 байта base64)")
+
+    @staticmethod
+    def _decode_reality_short_id(sid: str) -> bytes:
+        sid = sid.strip().lower()
+        if not sid:
+            return b"\x00" * 8
+        if len(sid) % 2:
+            sid += "0"
+        try:
+            raw = bytes.fromhex(sid)
+        except ValueError as exc:
+            raise ValueError("Некорректный shortId (ожидается hex)") from exc
+        if len(raw) > 8:
+            raise ValueError("shortId длиннее 8 байт")
+        return raw.ljust(8, b"\x00")
+
+    @staticmethod
+    def _apply_reality_session_id(
+        handshake_msg: bytearray,
+        private_key,
+        server_public_key: bytes,
+        short_id: bytes,
+    ) -> None:
+        """Зашифровать REALITY-токен в Session ID (как xray-core UClient)."""
+        _, _, X25519PublicKey, AESGCM, HKDF = TspuChecker._require_crypto()
+        from cryptography.hazmat.primitives import hashes
+
+        if len(handshake_msg) < 71 or handshake_msg[0] != 0x01:
+            raise ValueError("Некорректный TLS ClientHello")
+        random_bytes = bytes(handshake_msg[6:38])
+        session_plain = bytearray(32)
+        session_plain[0:3] = bytes(XRAY_VERSION)
+        session_plain[3] = 0
+        struct.pack_into("!I", session_plain, 4, int(time.time()) & 0xFFFFFFFF)
+        session_plain[8:16] = short_id
+        handshake_msg[38] = 0x20
+        handshake_msg[39:71] = session_plain
+
+        shared = private_key.exchange(X25519PublicKey.from_public_bytes(server_public_key))
+        auth_key = HKDF(
+            algorithm=hashes.SHA256(),
+            length=32,
+            salt=random_bytes[:20],
+            info=b"REALITY",
+        ).derive(shared)
+        sealed = AESGCM(auth_key).encrypt(
+            random_bytes[20:32],
+            bytes(session_plain[:16]),
+            bytes(handshake_msg),
+        )
+        if len(sealed) != 32:
+            raise ValueError(f"REALITY seal: ожидалось 32 байта, получено {len(sealed)}")
+        handshake_msg[39:71] = sealed
+
+    @staticmethod
+    def build_client_hello(
+        sni: str,
+        profile: str = "chrome",
+        *,
+        x25519_public_key: bytes | None = None,
+        reality_session: bool = False,
+    ) -> bytes:
         """Собрать TLS 1.3 ClientHello (Chrome-подобный) с указанным SNI."""
         host = sni.encode("ascii")
         sni_name = b"\x00" + struct.pack("!H", len(host)) + host
@@ -543,13 +871,16 @@ class TspuChecker:
             suites = [0x1301, 0x1302, 0xC02F, 0xC02B]
         else:
             suites = [
-                0x1301, 0x1302, 0x1303, 0xC02B, 0xC02F, 0xC02C, 0xC030,
-                0xCCA9, 0xCCA8, 0xC013, 0xC014, 0x009C, 0x009D, 0x002F, 0x0035,
+                0x0A0A,  # GREASE
+                0x1301, 0x1302, 0x1303,
+                0xC02B, 0xC02F, 0xC02C, 0xC030,
+                0xCCA9, 0xCCA8, 0xC013, 0xC014,
+                0x009C, 0x009D, 0x002F, 0x0035,
             ]
         cs_body = b"".join(struct.pack("!H", s) for s in suites)
         cipher_suites = struct.pack("!H", len(cs_body)) + cs_body
 
-        groups = b"\x00\x1d\x00\x17\x00\x18\x00\x19"
+        groups = b"\x2a\x2a\x00\x1d\x00\x17\x00\x18\x00\x19" if profile != "minimal" else b"\x00\x1d\x00\x17\x00\x18\x00\x19"
         groups_body = struct.pack("!H", len(groups)) + groups
         groups_ext = b"\x00\x0a" + struct.pack("!H", len(groups_body)) + groups_body
 
@@ -562,11 +893,14 @@ class TspuChecker:
         sig_body = struct.pack("!H", len(sig_algs)) + sig_algs
         sig_ext = b"\x00\x0d" + struct.pack("!H", len(sig_body)) + sig_body
 
-        vers = b"\x02\x03\x04"
+        vers = b"\x1a\x1a\x03\x04" if profile != "minimal" else b"\x02\x03\x04"
         vers_ext = b"\x00\x2b" + struct.pack("!H", len(vers)) + vers
 
-        key_entry = b"\x00\x1d" + struct.pack("!H", 32) + os.urandom(32)
-        ks_inner = struct.pack("!H", len(key_entry)) + key_entry
+        ks_public = x25519_public_key if x25519_public_key is not None else os.urandom(32)
+        grease_share = b"\x00\x2a" + struct.pack("!H", 1) + b"\x00" if profile != "minimal" else b""
+        x25519_share = b"\x00\x1d" + struct.pack("!H", 32) + ks_public
+        key_entries = grease_share + x25519_share
+        ks_inner = struct.pack("!H", len(key_entries)) + key_entries
         ks_ext = b"\x00\x33" + struct.pack("!H", len(ks_inner)) + ks_inner
 
         psk_modes = b"\x01\x01"
@@ -577,11 +911,38 @@ class TspuChecker:
 
         legacy_version = b"\x03\x03"
         random_bytes = os.urandom(32)
-        session_id = b"\x00"
+        session_id = b"\x20" + bytes(32) if reality_session else b"\x00"
         compression = b"\x01\x00"
         client_hello_body = legacy_version + random_bytes + session_id + cipher_suites + compression + extensions_block
         handshake_msg = b"\x01" + struct.pack("!I", len(client_hello_body))[1:] + client_hello_body
         return b"\x16\x03\x01" + struct.pack("!H", len(handshake_msg)) + handshake_msg
+
+    @classmethod
+    def build_reality_client_hello(cls, profile: VpnSubscriptionProfile) -> bytes:
+        """ClientHello с REALITY-аутентификацией (pbk, sid, fp) как в xray-core."""
+        if not profile.pbk or profile.sid is None:
+            raise ValueError("В профиле нет publicKey или shortId для REALITY")
+        _, X25519PrivateKey, *_ = cls._require_crypto()
+        server_public_key = cls._decode_reality_public_key(profile.pbk)
+        short_id = cls._decode_reality_short_id(profile.sid)
+        chlo_profile = cls._tls_fp_profile(profile.fp)
+
+        private_key = X25519PrivateKey.generate()
+        public_key = private_key.public_key().public_bytes_raw()
+        record = bytearray(
+            cls.build_client_hello(
+                profile.sni,
+                chlo_profile,
+                x25519_public_key=public_key,
+                reality_session=True,
+            )
+        )
+        handshake_msg = bytearray(record[5:])
+        cls._apply_reality_session_id(handshake_msg, private_key, server_public_key, short_id)
+        new_len = len(handshake_msg)
+        record[3:5] = struct.pack("!H", new_len)
+        record[5:] = handshake_msg
+        return bytes(record)
 
     @staticmethod
     def _tls_alert_name(code: int) -> str:
@@ -654,21 +1015,41 @@ class TspuChecker:
         )
 
     @staticmethod
+    def _recv_tls_response(sock: socket.socket, timeout: float) -> bytes:
+        chunks: list[bytes] = []
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            sock.settimeout(max(0.1, deadline - time.monotonic()))
+            try:
+                part = sock.recv(16384)
+            except socket.timeout:
+                break
+            except ConnectionResetError:
+                break
+            if not part:
+                break
+            chunks.append(part)
+            if sum(len(c) for c in chunks) >= 5:
+                break
+        return b"".join(chunks)
+
+    @staticmethod
     def probe_raw_client_hello(
         host: str,
         port: int,
         sni: str,
         profile: str = "chrome",
         timeout: float = 5.0,
+        hello: bytes | None = None,
     ) -> TlsProbeResult:
         """Отправить сырой ClientHello и прочитать первый ответ."""
         try:
             with socket.create_connection((host, port), timeout=timeout) as sock:
                 sock.settimeout(timeout)
-                hello = TspuChecker.build_client_hello(sni, profile)
-                sock.sendall(hello)
+                payload = hello if hello is not None else TspuChecker.build_client_hello(sni, profile)
+                sock.sendall(payload)
                 try:
-                    data = sock.recv(8192)
+                    data = TspuChecker._recv_tls_response(sock, timeout)
                 except ConnectionResetError:
                     return TlsProbeResult(
                         "reset",
@@ -684,9 +1065,35 @@ class TspuChecker:
                 return TlsProbeResult("timeout", "Таймаут")
             return TlsProbeResult("tcp_fail", str(e))
 
+    @classmethod
+    def probe_reality_client_hello(
+        cls,
+        profile: VpnSubscriptionProfile,
+        timeout: float = 8.0,
+    ) -> TlsProbeResult:
+        """REALITY ClientHello с pbk/sid/fp из подписки — ожидается Server Hello."""
+        try:
+            hello = cls.build_reality_client_hello(profile)
+        except (ValueError, ImportError) as exc:
+            return TlsProbeResult("error", str(exc))
+        return cls.probe_raw_client_hello(
+            profile.host,
+            profile.port,
+            profile.sni,
+            cls._tls_fp_profile(profile.fp),
+            timeout=timeout,
+            hello=hello,
+        )
+
     @staticmethod
-    def _print_probe(label: str, result: TlsProbeResult) -> None:
-        if result.path_reachable and result.status == "alert":
+    def _print_probe(
+        label: str, result: TlsProbeResult, *, reality_auth_failed: bool = False
+    ) -> None:
+        if (
+            result.path_reachable
+            and result.status == "alert"
+            and not reality_auth_failed
+        ):
             color = GREEN
             tag = f"OK (alert:{result.alert_name})"
         else:
@@ -1406,27 +1813,58 @@ class TspuChecker:
 
     # ===================================================================================================================================================
     def _print_tls_interpretation(
-        self, result: TlsProbeResult, method: str, *, reality_vps: bool = False
+        self,
+        result: TlsProbeResult,
+        method: str,
+        *,
+        reality_vps: bool = False,
+        reality_authenticated: bool = False,
+        vps_reachable: bool = False,
     ) -> None:
         print(f"\n{BLUE}📊 Интерпретация ({method}):{NC}")
         if result.status in ("ok", "server_hello"):
             print(f"  {GREEN}✅ TLS-этап до ответа сервера пройден.{NC}")
-            if reality_vps:
-                print("     Полный TLS с обычным клиентом — VPS не REALITY или fallback на реальный сайт.")
+            if reality_authenticated:
+                print(
+                    "     Через туннель xray пришли данные — REALITY+VLESS подтверждены."
+                )
+            elif reality_vps:
+                print(
+                    "     Прямой ответ VPS или fallback; для mlkem768 нужен успешный туннель xray."
+                )
             else:
                 print("     Если VPN всё равно падает — проверьте ключи REALITY, shortId, UUID.")
         elif result.alert_name == "handshake_failure":
-            print(
-                f"  {GREEN}✅ Это нормально для REALITY!{NC} Сервер получил Client Hello и отклонил "
-                "не-VLESS клиент."
-            )
-            print("     → Путь до VPS открыт, ТСПУ скорее всего не режет.")
-            print("     → 'TLS handshake error' в VPN-клиенте — проверьте конфиг REALITY на сервере и в приложении.")
+            if reality_authenticated:
+                print(
+                    f"  {RED}❌ REALITY отклонил аутентифицированный Client Hello.{NC}"
+                )
+                print("     → Проверьте publicKey, shortId, время на ПК и версию xray.")
+            else:
+                print(
+                    f"  {GREEN}✅ Это нормально для REALITY!{NC} Сервер получил Client Hello и отклонил "
+                    "не-VLESS клиент."
+                )
+                print("     → Путь до VPS открыт, ТСПУ скорее всего не режет.")
+                print("     → 'TLS handshake error' в VPN-клиенте — проверьте конфиг REALITY на сервере и в приложении.")
         elif result.status == "reset":
             print(f"  {RED}❌ RST после Client Hello — типичная блокировка ТСПУ (SNI/DPI).{NC}")
             print("     Попробуйте другой dest SNI (п. 16) или другой порт.")
         elif result.status == "timeout":
-            print(f"  {YELLOW}⚠️ Таймаут — белый список L3, мёртвый VPS или фильтр без RST.{NC}")
+            if method.startswith("xray/") and vps_reachable:
+                print(
+                    f"  {YELLOW}⚠️ Туннель xray: данных от 1.1.1.1 нет, но VPS по шагу 4 доступен.{NC}"
+                )
+                print(
+                    "     → REALITY/uTLS в xray не успел или 1.1.1.1 не отвечает через VPN."
+                )
+                print(
+                    "     → Если обычный VPN-клиент работает — это не блокировка VPS/ТСПУ."
+                )
+            else:
+                print(
+                    f"  {YELLOW}⚠️ Таймаут — нет ответа через туннель или TCP до VPS недоступен.{NC}"
+                )
         elif result.status == "alert":
             print(f"  {YELLOW}⚠️ TLS Alert ({result.alert_name}) — сервер ответил отказом.{NC}")
             if reality_vps:
@@ -1523,6 +1961,55 @@ class TspuChecker:
 
         self.pause()
 
+    @staticmethod
+    def _short_url(url: str, max_len: int = 64) -> str:
+        return url if len(url) <= max_len else url[: max_len - 3] + "..."
+
+    def _select_subscription_url(self) -> tuple[str, bool] | None:
+        """Подменю выбора подписки. Возвращает (url, from_config) или None при отмене."""
+        if self.subscription_urls:
+            print(f"{CYAN}── Выбор подписки ──{NC}")
+            for i, url in enumerate(self.subscription_urls):
+                print(f"  {BLUE}{i}{NC}) {self._short_url(url)}")
+            manual_idx = len(self.subscription_urls)
+            print(f"  {BLUE}{manual_idx}{NC}) Ввести URL вручную")
+            default = "0"
+            choice = input(f"\nВыберите подписку [{default}]: ").strip() or default
+            try:
+                idx = int(choice)
+            except ValueError:
+                print(f"{RED}❌ Неверный номер подписки{NC}")
+                return None
+            if idx == manual_idx:
+                url = input("URL подписки: ").strip()
+                if not url:
+                    print(f"{RED}❌ URL подписки не задан{NC}")
+                    return None
+                if not url.startswith(("http://", "https://")):
+                    print(f"{RED}❌ URL должен начинаться с http:// или https://{NC}")
+                    return None
+                return url, False
+            if not 0 <= idx < len(self.subscription_urls):
+                print(f"{RED}❌ Неверный номер подписки{NC}")
+                return None
+            url = self.subscription_urls[idx]
+            print(f"\n{GREEN}✓ Подписка [{idx}]:{NC} {self._short_url(url)}\n")
+            return url, True
+
+        print(f"{CYAN}Подписок в server.conf нет — введите URL.{NC}")
+        url = input("URL подписки: ").strip()
+        if not url:
+            print(f"{RED}❌ URL подписки не задан{NC}")
+            print(
+                f"{CYAN}Добавьте SUBSCRIPTION_URL_0 … SUBSCRIPTION_URL_N в server.conf "
+                f"или введите URL здесь.{NC}"
+            )
+            return None
+        if not url.startswith(("http://", "https://")):
+            print(f"{RED}❌ URL должен начинаться с http:// или https://{NC}")
+            return None
+        return url, False
+
     # ===================================================================================================================================================
     # ====================================================================== 20 VPN-клиент: подписка → Client Hello ======================================
     # ===================================================================================================================================================
@@ -1532,27 +2019,15 @@ class TspuChecker:
         self.print_header()
         print(f"{YELLOW}[20] 📲 VPN-клиент: подписка → Client Hello{NC}\n")
         print(
-            f"{CYAN}Как в реальном клиенте: берём параметры из подписки "
-            f"(SNI, fp, порт) и отправляем начальный TLS Client Hello.{NC}\n"
+            f"{CYAN}Полная имитация VPN-клиента: xray-core (uTLS + REALITY + VLESS).{NC}\n"
+            f"{CYAN}Для подписок с mlkem768 нужен xray в PATH или XRAY_PATH.{NC}\n"
         )
 
-        url_from_config = bool(self.subscription_url)
-        if url_from_config:
-            url = self.subscription_url
-            url_display = url if len(url) <= 64 else url[:61] + "..."
-            print(f"{GREEN}✓ Подписка из конфига:{NC} {url_display}\n")
-        else:
-            url_prompt = "URL подписки: "
-            url = input(url_prompt).strip()
-            if not url:
-                print(f"{RED}❌ URL подписки не задан{NC}")
-                print(f"{CYAN}Добавьте SUBSCRIPTION_URL в server.conf или введите URL здесь.{NC}")
-                self.pause()
-                return
-            if not url.startswith(("http://", "https://")):
-                print(f"{RED}❌ URL должен начинаться с http:// или https://{NC}")
-                self.pause()
-                return
+        picked = self._select_subscription_url()
+        if picked is None:
+            self.pause()
+            return
+        url, url_from_config = picked
 
         print(f"\n{CYAN}── 1. Загрузка подписки ──{NC}")
         try:
@@ -1603,41 +2078,116 @@ class TspuChecker:
             return
         print(f"{GREEN}OK{NC}")
 
-        print(f"\n{CYAN}── 4. Client Hello (fp={profile.fp} → {chlo_profile}) ──{NC}")
-        print(f"  SNI={sni}, как в подписке\n")
-        result = self.probe_raw_client_hello(host, port, sni, chlo_profile)
-        self._print_probe(f"Ответ сервера на Client Hello ({chlo_profile})", result)
-        self._print_tls_interpretation(result, f"подписка/{profile.fp}", reality_vps=profile.security == "reality")
+        use_reality = profile.security == "reality" and profile.pbk and profile.sid is not None
+        xray_bin = self.find_xray_binary() if use_reality else None
+        direct_result: TlsProbeResult | None = None
+        tunnel_result: TlsProbeResult | None = None
+        method = f"подписка/{profile.fp}"
 
-        # if profile.security == "reality":
-        #     print(f"\n{CYAN}── 5. Сравнение с OpenSSL (не uTLS-клиент) ──{NC}")
-        #     openssl_result = self.tls_probe_openssl(host, port, sni)
-        #     self._print_probe("TLS (OpenSSL)", openssl_result)
-        #     if result.path_reachable and openssl_result.status in ("reset", "timeout"):
-        #         print(
-        #             f"\n  {YELLOW}⚠️ Подписка/uTLS проходит, OpenSSL — нет: "
-        #             f"VPN-клиент с fp={profile.fp} может работать, обычный TLS — нет.{NC}"
-        #         )
-        #     elif result.status in ("reset", "timeout") and openssl_result.path_reachable:
-        #         print(
-        #             f"\n  {YELLOW}⚠️ OpenSSL проходит, Client Hello из подписки — нет: "
-        #             f"ТСПУ может резать отпечаток fp={profile.fp}.{NC}"
-        #         )
+        if use_reality and self._needs_xray_for_profile(profile) and not xray_bin:
+            print(f"\n{RED}❌ Подписка использует VLESS Encryption (mlkem768).{NC}")
+            print(
+                f"{YELLOW}Для полного туннеля нужен xray-core:{NC}\n"
+                f"  • скачайте Xray-windows-64.zip с github.com/XTLS/Xray-core/releases\n"
+                f"  • положите xray.exe рядом с net_check.py или добавьте в PATH\n"
+                f"  • либо задайте переменную окружения XRAY_PATH"
+            )
+            self.pause()
+            return
+
+        if use_reality:
+            print(
+                f"\n{CYAN}── 4. Прямой TLS → VPS (видно в tcpdump на {host}:{port}) ──{NC}"
+            )
+            print(f"  Client Hello напрямую из скрипта, без xray\n")
+            direct_result = self.probe_reality_client_hello(profile)
+            self._print_probe(
+                "Ответ VPS на прямой Client Hello",
+                direct_result,
+                reality_auth_failed=direct_result.alert_name == "handshake_failure",
+            )
+
+            if xray_bin:
+                print(f"\n{CYAN}── 5. Туннель через xray ({xray_bin.name}) ──{NC}")
+                print(
+                    f"  {YELLOW}Успех только если через туннель пришли данные; "
+                    f"SOCKS CONNECT сам по себе не считается успехом.{NC}\n"
+                )
+                tunnel_result = self.probe_reality_via_xray(profile)
+                method = f"xray/{profile.fp}"
+                self._print_probe("Проверка туннеля xray", tunnel_result)
+
+            result = tunnel_result or direct_result
+        else:
+            print(f"\n{CYAN}── 4. Client Hello (fp={profile.fp} → {chlo_profile}) ──{NC}")
+            print(f"  SNI={sni}, без REALITY-auth (нет pbk/sid в подписке)\n")
+            result = self.probe_raw_client_hello(host, port, sni, chlo_profile)
+            self._print_probe(f"Ответ сервера на Client Hello ({chlo_profile})", result)
+
+        self._print_tls_interpretation(
+            result,
+            method,
+            reality_vps=use_reality,
+            reality_authenticated=bool(
+                tunnel_result and tunnel_result.status in ("ok", "server_hello")
+            ),
+            vps_reachable=bool(
+                direct_result and (
+                    direct_result.path_reachable
+                    or direct_result.alert_name == "handshake_failure"
+                )
+            ),
+        )
 
         print(f"\n{BLUE}═══ Итог для VPN-клиента ═══{NC}")
-        if result.alert_name == "handshake_failure":
+        if use_reality and direct_result:
+            if direct_result.status in ("ok", "server_hello"):
+                print(
+                    f"  {GREEN}● Прямой TLS к VPS: ответ сервера получен "
+                    f"(должен быть виден в tcpdump на {host}:{port}).{NC}"
+                )
+            elif direct_result.alert_name == "handshake_failure":
+                print(
+                    f"  {YELLOW}● Прямой TLS: handshake_failure — пакет дошёл до VPS, "
+                    f"но REALITY-auth не принят (упрощённый Python-CHLO).{NC}"
+                )
+            elif direct_result.status in ("reset", "timeout"):
+                print(
+                    f"  {RED}● Прямой TLS: нет ответа — Client Hello, возможно, не доходит до VPS.{NC}"
+                )
+
+        if tunnel_result:
+            if tunnel_result.status in ("ok", "server_hello"):
+                print(
+                    f"  {GREEN}● Туннель xray: данные прошли — REALITY+VLESS работают "
+                    f"(на сервере должен быть TLS к {host}:{port}).{NC}"
+                )
+            elif tunnel_result.status == "timeout":
+                print(
+                    f"  {RED}● Туннель xray: TLS не подтверждён — в логе xray есть ошибка "
+                    f"или туннель не установился.{NC}"
+                )
+            elif tunnel_result.status in ("ok", "server_hello") and tunnel_result.bytes_received == 0:
+                print(
+                    f"  {GREEN}● Туннель xray: TLS к VPS, похоже, прошёл (ошибок в логе xray нет).{NC}\n"
+                    f"     Ответ от 1.1.1.1 не получен — возможен белый список dest, не VPS."
+                )
+            elif tunnel_result.alert_name == "handshake_failure":
+                print(f"  {RED}● Туннель xray: TLS handshake failure.{NC}")
+        elif use_reality and not xray_bin:
             print(
-                f"  {GREEN}● REALITY ответил handshake_failure — начальный TLS дошёл до VPS.{NC}\n"
-                f"     Если клиент всё равно не подключается — проверьте UUID, shortId, publicKey в подписке."
+                f"  {YELLOW}● Туннель xray не проверялся (xray не найден). "
+                f"Смотрите только прямой TLS (шаг 4).{NC}"
             )
-        elif result.path_reachable:
-            print(f"  {GREEN}● Начальный Client Hello прошёл — сеть, скорее всего, не блокирует VPN.{NC}")
-        elif result.status in ("reset", "timeout"):
+        elif not use_reality and result.status in ("ok", "server_hello"):
+            print(f"  {GREEN}● Client Hello прошёл — сеть, скорее всего, не блокирует.{NC}")
+        elif not use_reality and result.path_reachable:
+            print(f"  {GREEN}● Начальный Client Hello дошёл до сервера.{NC}")
+        elif not use_reality and result.status in ("reset", "timeout"):
             print(
-                f"  {RED}● Client Hello не доходит — возможна блокировка ТСПУ по SNI '{sni}' "
-                f"или IP {host}.{NC}"
+                f"  {RED}● Client Hello не доходит — возможна блокировка ТСПУ по SNI '{sni}'.{NC}"
             )
-        else:
+        elif not use_reality:
             print(f"  {YELLOW}● Неоднозначный результат — см. детали выше.{NC}")
 
         if not url_from_config:
@@ -1645,7 +2195,20 @@ class TspuChecker:
                 f"\n{CYAN}Сохранить URL подписки и параметры в конфиг? [y/N]: {NC}"
             ).strip().lower()
             if save in ("y", "yes", "д", "да"):
-                self.subscription_url = url
+                if self.subscription_urls:
+                    slot = input(
+                        f"{CYAN}Номер слота SUBSCRIPTION_URL_N [0]: {NC}"
+                    ).strip() or "0"
+                    try:
+                        slot_idx = int(slot)
+                    except ValueError:
+                        slot_idx = 0
+                    while len(self.subscription_urls) <= slot_idx:
+                        self.subscription_urls.append("")
+                    self.subscription_urls[slot_idx] = url
+                else:
+                    self.subscription_urls = [url]
+                self.subscription_url = self.subscription_urls[0]
                 self.server_ip = host
                 self.reality_port = port
                 self.reality_sni = sni
